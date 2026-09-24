@@ -9,9 +9,12 @@ services:
         value: 10000
       - key: DEFAULT_SPEED
         value: 1.12
-      - key: DEFAULT_VOICE
-        value: af_heart
-      - key: KOKORO_DTYPE
-        value: q4 # lighter than q8 — trades a little voice quality for headroom under 512MB; bump to q8/fp32 once on a paid plan
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false # set manually in the Render dashboard — same account you already use for the Flux image node
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false # set manually in the Render dashboard — secret, don't commit it
+      - key: CLOUDFLARE_TTS_MODEL
+        value: "@cf/myshell-ai/melotts"
       - key: AUTO_CLEANUP_MINUTES
         value: 30
+        
