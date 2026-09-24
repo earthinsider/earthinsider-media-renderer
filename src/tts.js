@@ -12,12 +12,12 @@ async function getTTS() {
     //
     // dtype options (roughly best quality -> fastest/lightest):
     //   "fp32" > "fp16" > "q8" > "q4"
-    // "q8" is a reasonable default balance of quality vs CPU load on Render.
-    // Bump to "fp32" if you want the best possible quality and the Render
-    // plan has the RAM/CPU to spare.
+    // Defaults to "q4" so it fits Render's free 512MB plan. Once you move
+    // to a paid plan with more RAM, set KOKORO_DTYPE=q8 or fp32 for better
+    // voice quality.
     ttsInstance = await KokoroTTS.from_pretrained(
       "onnx-community/Kokoro-82M-v1.0-ONNX",
-      { dtype: process.env.KOKORO_DTYPE || "q8" }
+      { dtype: process.env.KOKORO_DTYPE || "q4" }
     );
   }
   return ttsInstance;
