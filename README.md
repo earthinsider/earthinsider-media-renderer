@@ -59,16 +59,85 @@ curl -X POST http://localhost:10000/render \
   -d '{"text":"This is a test.","image_url":"https://example.com/test.jpg"}'
 ```
 
-## Deploying on Render
-- Push this repo to GitHub, connect it as a **Docker** web service on Render
-  (the included `Dockerfile` installs ffmpeg; `render.yaml` is a ready-made
-  blueprint if you want to use Render's Blueprints feature).
-- Give it real memory headroom — Kokoro (`q8`) plus ffmpeg encoding two
-  videos per request needs more than a starter instance. Start at 2GB RAM
-  and adjust based on actual render times/costs.
-- `KOKORO_DTYPE` can be bumped to `fp32` for the best possible voice quality
-  if the plan has RAM/CPU to spare, or dropped to `q4` if you need it
-  lighter/faster.
+## Render free plan — caveats
+
+Starting on the free plan to test this before paying for anything is
+reasonable, but know what you're trading off:
+
+- **512MB RAM, shared CPU.** `KOKORO_DTYPE` defaults to `q4` here
+  specifically to leave headroom for Node + ffmpeg alongside the model.
+  It's still possible a `/render` call OOMs on a big image or long script —
+  if that happens, that's the signal to upgrade the plan (bump back to
+  `q8`/`fp32` once you do, for better voice quality).
+- **Spins down after ~15 minutes idle**, then cold-starts on the next
+  request — expect the first `/render` after a quiet period to take much
+  longer (model has to load into memory again) before it settles into
+  normal speed.
+- **Ephemeral disk** — fine for this service, since job files are meant to
+  be temporary anyway and get deleted after upload.
+- Free plan is genuinely OK for *testing the pipeline end-to-end*. Once
+  n8n is calling this in production on a schedule, a paid instance (no
+  spin-down, more RAM, better `dtype`) will give faster and more reliable
+  renders.
+
+## Step-by-step setup
+
+1. **Unzip this project** and turn it into its own GitHub repo:
+   ```bash
+   cd earthinsider-media-renderer
+   git init
+   git add .
+   git commit -m "Initial render service"
+   git branch -M main
+   git remote add origin https://github.com/<your-username>/earthinsider-media-renderer.git
+   git push -u origin main
+   ```
+
+2. **Create the service on Render:**
+   - Render dashboard → **New** → **Web Service**
+   - Connect the GitHub repo you just pushed
+   - Environment: **Docker** (Render will auto-detect the `Dockerfile`)
+   - Instance type: **Free**
+   - Health check path: `/health`
+
+3. **Set environment variables** (Render dashboard → Environment), matching
+   `.env.example`:
+   - `DEFAULT_SPEED=1.12`
+   - `DEFAULT_VOICE=af_heart`
+   - `KOKORO_DTYPE=q4`
+   - `AUTO_CLEANUP_MINUTES=30`
+
+   (If you'd rather not click through the UI, `render.yaml` in this repo
+   already has all of this — use Render's **Blueprints** flow instead and
+   it'll read the file directly.)
+
+4. **Deploy** and wait for the build to finish (first build installs ffmpeg
+   via the Dockerfile + npm installs kokoro-js — can take a few minutes).
+
+5. **Sanity check** once it's live:
+   ```bash
+   curl https://<your-service>.onrender.com/health
+   ```
+
+6. **Test a real render** (first call will be slow — cold start + first
+   model load):
+   ```bash
+   curl -X POST https://<your-service>.onrender.com/render \
+     -H "Content-Type: application/json" \
+     -d '{"text":"This is a test of the voice.","image_url":"https://<any-public-image>.jpg"}'
+   ```
+   You should get back `job_id`, `duration_seconds`, `reel_url`, `wide_url`.
+   Open those URLs in a browser to check the actual video output.
+
+7. **Clean up the test job** so it doesn't just sit there until the
+   auto-cleanup timer:
+   ```bash
+   curl -X DELETE https://<your-service>.onrender.com/files/<job_id>
+   ```
+
+Once this all works, next step is wiring it into n8n (HTTP Request node →
+`POST /render`, then two more HTTP Request nodes with response format
+"file" to fetch `reel_url`/`wide_url`).
 
 ## Things to double-check before relying on this
 - **kokoro-js API**: the model id and `.generate()` / `.save()` calls in
