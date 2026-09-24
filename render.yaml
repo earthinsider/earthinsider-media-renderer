@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: earthinsider-media-renderer
+    env: docker
+    plan: standard # Kokoro (q8) + ffmpeg encoding need real RAM — test on a plan with at least 2GB before dropping down
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DEFAULT_SPEED
+        value: 1.12
+      - key: DEFAULT_VOICE
+        value: af_heart
+      - key: KOKORO_DTYPE
+        value: q8
+      - key: AUTO_CLEANUP_MINUTES
+        value: 30

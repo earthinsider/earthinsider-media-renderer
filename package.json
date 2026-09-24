@@ -1,0 +1,18 @@
+{
+  "name": "earthinsider-media-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Render service for EarthInsider: text-to-speech + Ken Burns style video rendering (9:16 and 16:9) from a static social image, called by n8n.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "kokoro-js": "^1.2.0"
+  }
+}
