@@ -34,7 +34,7 @@ export async function generateSpeech(text, outputPath) {
       Authorization: `Bearer ${CF_API_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ prompt: text }),
   });
 
   if (!res.ok) {
