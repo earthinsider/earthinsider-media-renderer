@@ -60,30 +60,45 @@ app.post("/render", async (req, res) => {
 
   const jobId = randomUUID();
   const dir = jobDir(jobId);
+  const t0 = Date.now();
+  const lap = (label, from) => {
+    const ms = Date.now() - from;
+    console.log(`[render:${jobId}] ${label}: ${(ms / 1000).toFixed(1)}s`);
+    return Date.now();
+  };
 
   try {
     await mkdir(dir, { recursive: true });
 
     // 1. Source image
+    let t = Date.now();
     const imagePath = path.join(dir, "source.jpg");
     await downloadToFile(image_url, imagePath);
+    t = lap("download image", t);
 
     // 2. Text -> speech
     const rawAudioPath = path.join(dir, "voice_raw.wav");
     await generateSpeech(text, rawAudioPath, { voice });
+    t = lap("cloudflare tts", t);
 
     // 3. Speed up (pitch preserved)
     const finalAudioPath = path.join(dir, "voice.wav");
     await speedUpAudio(rawAudioPath, finalAudioPath, speed || DEFAULT_SPEED);
+    t = lap("speed up audio", t);
 
     // 4. Duration drives both videos' length
     const durationSeconds = await getAudioDuration(finalAudioPath);
+    t = lap("probe duration", t);
 
     // 5. Render both formats
     const reelPath = path.join(dir, "reel.mp4");
     const widePath = path.join(dir, "wide.mp4");
     await buildReel(imagePath, finalAudioPath, durationSeconds, reelPath);
+    t = lap("build reel", t);
     await buildWide(imagePath, finalAudioPath, durationSeconds, widePath);
+    t = lap("build wide", t);
+
+    lap("TOTAL", t0);
 
     // 6. Schedule the safety-net cleanup
     setTimeout(() => {
