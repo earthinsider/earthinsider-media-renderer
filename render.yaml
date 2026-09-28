@@ -17,4 +17,7 @@ services:
         value: "@cf/myshell-ai/melotts"
       - key: AUTO_CLEANUP_MINUTES
         value: 30
-        
+      - key: BLUESKY_IDENTIFIER
+        value: earthinsider.bsky.social
+      - key: BLUESKY_PASSWORD
+        sync: false
