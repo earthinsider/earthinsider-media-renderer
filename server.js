@@ -42,6 +42,84 @@ async function downloadToFile(url, destPath) {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+const BLUESKY_IDENTIFIER = process.env.BLUESKY_IDENTIFIER || "earthinsider.bsky.social";
+const BLUESKY_PASSWORD   = process.env.BLUESKY_PASSWORD;
+
+/**
+ * POST /bluesky-post
+ * Body: { video_url, text, facets?, published_url?, card_title?, card_description? }
+ *
+ * Handles the full Bluesky video post flow on this server so n8n never has
+ * to hold large binary video data in memory:
+ *   1. Create session
+ *   2. Download video from render's own /files/ URL (local-ish fetch)
+ *   3. Upload blob to Bluesky
+ *   4. Create post record (app.bsky.embed.video)
+ */
+app.post("/bluesky-post", async (req, res) => {
+  const { video_url, text, facets, published_url, card_title, card_description } = req.body || {};
+
+  if (!video_url || !text) {
+    return res.status(400).json({ error: "video_url and text are required" });
+  }
+  if (!BLUESKY_PASSWORD) {
+    return res.status(500).json({ error: "BLUESKY_PASSWORD env var not set" });
+  }
+
+  try {
+    // 1. Auth
+    const sessionRes = await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier: BLUESKY_IDENTIFIER, password: BLUESKY_PASSWORD }),
+    });
+    const session = await sessionRes.json();
+    if (!session.accessJwt) {
+      throw new Error("Bluesky auth failed: " + JSON.stringify(session).slice(0, 200));
+    }
+
+    // 2. Download video (fetching from our own /files/ URL — lightweight)
+    const vidRes = await fetch(video_url);
+    if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
+    const vidBuf = Buffer.from(await vidRes.arrayBuffer());
+
+    // 3. Upload blob
+    const blobRes = await fetch("https://bsky.social/xrpc/com.atproto.repo.uploadBlob", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessJwt}`, "Content-Type": "video/mp4" },
+      body: vidBuf,
+    });
+    const blobData = await blobRes.json();
+    if (!blobData.blob) {
+      throw new Error("Blob upload failed: " + JSON.stringify(blobData).slice(0, 200));
+    }
+
+    // 4. Create post record
+    const record = {
+      "$type": "app.bsky.feed.post",
+      text,
+      facets: facets || [],
+      createdAt: new Date().toISOString(),
+      embed: {
+        "$type": "app.bsky.embed.video",
+        video: blobData.blob,
+        aspectRatio: { width: 9, height: 16 },
+      },
+    };
+    const postRes = await fetch("https://bsky.social/xrpc/com.atproto.repo.createRecord", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessJwt}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: session.did, collection: "app.bsky.feed.post", record }),
+    });
+    const postData = await postRes.json();
+
+    res.json({ success: true, uri: postData.uri, cid: postData.cid });
+  } catch (err) {
+    console.error("[bluesky-post]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /**
  * POST /render
  * Body: { text: string, image_url: string, speed?: number, voice?: string }
