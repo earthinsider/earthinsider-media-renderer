@@ -1,6 +1,6 @@
 import express from "express";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
@@ -196,6 +196,99 @@ app.post("/render", async (req, res) => {
   }
 });
 
+// ── Tumblr ────────────────────────────────────────────────────────────────────
+const TUMBLR_CONSUMER_KEY    = process.env.TUMBLR_CONSUMER_KEY;
+const TUMBLR_CONSUMER_SECRET = process.env.TUMBLR_CONSUMER_SECRET;
+const TUMBLR_ACCESS_TOKEN    = process.env.TUMBLR_ACCESS_TOKEN;
+const TUMBLR_ACCESS_SECRET   = process.env.TUMBLR_ACCESS_SECRET;
+const TUMBLR_BLOG            = process.env.TUMBLR_BLOG || "earthinsider.tumblr.com";
+
+// OAuth1 header for multipart/form-data requests.
+// Per OAuth1 spec: body params are NOT included in the signature base string
+// for multipart uploads — only the OAuth header params go in.
+function buildTumblrOAuthHeader(method, url) {
+  const nonce     = randomUUID().replace(/-/g, "");
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  const oauthParams = {
+    oauth_consumer_key:     TUMBLR_CONSUMER_KEY,
+    oauth_nonce:            nonce,
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp:        timestamp,
+    oauth_token:            TUMBLR_ACCESS_TOKEN,
+    oauth_version:          "1.0",
+  };
+
+  const paramStr = Object.keys(oauthParams)
+    .sort()
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
+    .join("&");
+
+  const baseString = [
+    method.toUpperCase(),
+    encodeURIComponent(url),
+    encodeURIComponent(paramStr),
+  ].join("&");
+
+  const signingKey = `${encodeURIComponent(TUMBLR_CONSUMER_SECRET)}&${encodeURIComponent(TUMBLR_ACCESS_SECRET)}`;
+  oauthParams.oauth_signature = createHmac("sha1", signingKey).update(baseString).digest("base64");
+
+  return "OAuth " + Object.entries(oauthParams)
+    .map(([k, v]) => `${k}="${encodeURIComponent(v)}"`)
+    .join(", ");
+}
+
+/**
+ * POST /tumblr-video
+ * Body: { video_url, caption, tags }
+ * Downloads the video from our own /files/ URL, signs the request with
+ * OAuth1, and posts to Tumblr's legacy video endpoint — so n8n never
+ * needs to touch the binary file.
+ */
+app.post("/tumblr-video", async (req, res) => {
+  const { video_url, caption, tags } = req.body || {};
+
+  if (!video_url) return res.status(400).json({ error: "video_url is required" });
+  if (!TUMBLR_CONSUMER_KEY || !TUMBLR_CONSUMER_SECRET || !TUMBLR_ACCESS_TOKEN || !TUMBLR_ACCESS_SECRET) {
+    return res.status(500).json({ error: "Tumblr credential env vars not set" });
+  }
+
+  try {
+    // 1. Download video
+    const vidRes = await fetch(video_url);
+    if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
+    const vidBuf = Buffer.from(await vidRes.arrayBuffer());
+
+    // 2. Build multipart form — Node 18+ built-in FormData + Blob
+    const form = new FormData();
+    form.append("type",    "video");
+    form.append("caption", caption || "");
+    form.append("tags",    tags    || "");
+    form.append("data",    new Blob([vidBuf], { type: "video/mp4" }), "video.mp4");
+
+    // 3. OAuth1 sign + post
+    const tumblrUrl = `https://api.tumblr.com/v2/blog/${TUMBLR_BLOG}/post`;
+    const authHeader = buildTumblrOAuthHeader("POST", tumblrUrl);
+
+    const postRes = await fetch(tumblrUrl, {
+      method:  "POST",
+      headers: { Authorization: authHeader },
+      body:    form,
+    });
+
+    const data = await postRes.json().catch(() => ({}));
+    if (!postRes.ok) {
+      throw new Error(`Tumblr failed (${postRes.status}): ${JSON.stringify(data).slice(0, 300)}`);
+    }
+
+    res.json({ success: true, tumblr_id: data.response?.id });
+  } catch (err) {
+    console.error("[tumblr-video]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Static file serving ───────────────────────────────────────────────────────
 // Serves the two rendered files for a job so n8n can fetch them.
 app.get("/files/:jobId/:filename", (req, res) => {
   const { jobId, filename } = req.params;
