@@ -310,3 +310,4 @@ app.delete("/files/:jobId", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`earthinsider-media-renderer listening on :${PORT}`);
 });
+  
