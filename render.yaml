@@ -8,7 +8,7 @@ services:
       - key: PORT
         value: 10000
       - key: DEFAULT_SPEED
-        value: 1.12
+        value: 1.00
       - key: CLOUDFLARE_ACCOUNT_ID
         sync: false # set manually in the Render dashboard — same account you already use for the Flux image node
       - key: CLOUDFLARE_API_TOKEN
