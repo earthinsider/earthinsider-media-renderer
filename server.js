@@ -155,7 +155,7 @@ app.post("/render", async (req, res) => {
     t = lap("download image", t);
 
     // 2. Text -> speech
-    const rawAudioPath = path.join(dir, "voice_raw.wav");
+    const rawAudioPath = path.join(dir, "voice_raw.mp3");
     await generateSpeech(text, rawAudioPath, { voice });
     t = lap("cloudflare tts", t);
 
@@ -310,4 +310,3 @@ app.delete("/files/:jobId", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`earthinsider-media-renderer listening on :${PORT}`);
 });
-  
