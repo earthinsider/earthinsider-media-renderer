@@ -1,9 +1,8 @@
 FROM node:20-slim
 
-# ffmpeg (includes ffprobe) from Debian's repos — full codec support
-# (libx264, aac, atempo, zoompan) with no extra build steps.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg python3 python3-pip && \
+    pip3 install edge-tts --break-system-packages && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
