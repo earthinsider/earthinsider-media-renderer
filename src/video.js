@@ -3,30 +3,18 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
-// Background: same image scaled to fill canvas, heavy blur + darkened.
-// Foreground: original image scaled to fit, centered.
-// No pure black bars — the blurred image fills the leftover space.
-function blurBgFilter(W, H) {
-  return (
-    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,` +
-    `crop=${W}:${H},` +
-    `boxblur=luma_radius=25:luma_power=1,` +
-    `eq=brightness=-0.40[bg];` +
-    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease[fg];` +
-    `[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,` +
-    `setsar=1[out]`
-  );
-}
-
 async function buildVideo(imagePath, audioPath, durationSec, outPath, W, H, extraArgs = []) {
+  const vf =
+    `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+    `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,` +
+    `setsar=1`;
+
   await run("ffmpeg", [
     "-y",
     "-loop", "1",
     "-i", imagePath,
     "-i", audioPath,
-    "-filter_complex", blurBgFilter(W, H),
-    "-map", "[out]",
-    "-map", "1:a",
+    "-vf", vf,
     "-c:v", "libx264",
     "-preset", "fast",
     "-crf", "20",
@@ -42,14 +30,13 @@ async function buildVideo(imagePath, audioPath, durationSec, outPath, W, H, extr
   ]);
 }
 
-// 9:16 reel — 1080x1920
-// -aspect 9:16 explicitly flags the container as vertical so Buffer/YouTube
-// correctly detect portrait orientation (setsar=1 alone wasn't enough).
+// 9:16 reel — 1080x1920, black letterbox
+// -aspect 9:16 explicitly flags portrait so Buffer/YouTube detect it correctly
 export async function buildReel(imagePath, audioPath, durationSec, outPath) {
   return buildVideo(imagePath, audioPath, durationSec, outPath, 1080, 1920, ["-aspect", "9:16"]);
 }
 
-// 16:9 wide — 1920x1080
+// 16:9 wide — 1920x1080, black pillarbox
 export async function buildWide(imagePath, audioPath, durationSec, outPath) {
   return buildVideo(imagePath, audioPath, durationSec, outPath, 1920, 1080);
 }
