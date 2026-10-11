@@ -4,23 +4,23 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 /**
- * Speeds up an audio file without changing its pitch, using ffmpeg's
- * atempo filter. atempo accepts 0.5–2.0 in a single pass, which covers
- * any realistic speed-up for a voiceover.
+ * Speed up audio (pitch preserved) and prepend silence for the hook text.
+ * silenceBefore: seconds of silence added at the start so the hook text
+ * shows before the voiceover begins.
  */
-export async function speedUpAudio(inputPath, outputPath, speed = 1.12) {
+export async function speedUpAudio(inputPath, outputPath, speed = 1.0, silenceBefore = 2.0) {
+  const delayMs  = Math.round(silenceBefore * 1000);
+  const filterStr = `adelay=${delayMs}|${delayMs},atempo=${speed}`;
+
   await run("ffmpeg", [
     "-y",
     "-i", inputPath,
-    "-filter:a", `atempo=${speed}`,
+    "-filter:a", filterStr,
     "-vn",
     outputPath,
   ]);
 }
 
-/**
- * Returns the duration (in seconds, float) of an audio/video file via ffprobe.
- */
 export async function getAudioDuration(filePath) {
   const { stdout } = await run("ffprobe", [
     "-v", "error",
@@ -28,9 +28,7 @@ export async function getAudioDuration(filePath) {
     "-of", "default=noprint_wrappers=1:nokey=1",
     filePath,
   ]);
-  const seconds = parseFloat(stdout.trim());
-  if (!Number.isFinite(seconds)) {
-    throw new Error(`Could not read duration from ${filePath}`);
-  }
-  return seconds;
+  const s = parseFloat(stdout.trim());
+  if (!Number.isFinite(s)) throw new Error(`Cannot read duration from ${filePath}`);
+  return s;
 }
