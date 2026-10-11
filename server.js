@@ -1,187 +1,185 @@
 import express from "express";
 import path from "node:path";
 import { randomUUID, createHmac } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 
-import { generateSpeech } from "./src/tts.js";
+import { generateSpeech }              from "./src/tts.js";
 import { speedUpAudio, getAudioDuration } from "./src/audio.js";
-import { buildReel, buildWide } from "./src/video.js";
+import { buildReel, buildWide }        from "./src/video.js";
+import { parseVTT, buildASS, HOOK_DURATION_SECS } from "./src/subtitles.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 10000;
-const JOBS_DIR = path.join(process.cwd(), "jobs");
-const DEFAULT_SPEED = Number(process.env.DEFAULT_SPEED || 1.12);
-// Safety net: auto-delete a job's files this long after creation, in case
-// the caller (n8n) never hits DELETE /files/:jobId after uploading to Cloudinary.
-const AUTO_CLEANUP_MS =
-  Number(process.env.AUTO_CLEANUP_MINUTES || 30) * 60 * 1000;
+const PORT            = process.env.PORT            || 10000;
+const DEFAULT_SPEED   = Number(process.env.DEFAULT_SPEED || 1.0);
+const AUTO_CLEANUP_MS = Number(process.env.AUTO_CLEANUP_MINUTES || 30) * 60 * 1000;
+const JOBS_DIR        = path.join(process.cwd(), "jobs");
 
 await mkdir(JOBS_DIR, { recursive: true });
 
-function jobDir(jobId) {
-  return path.join(JOBS_DIR, jobId);
-}
+function jobDir(id)            { return path.join(JOBS_DIR, id); }
+function publicUrl(req, id, f) { return `${req.protocol}://${req.get("host")}/files/${id}/${f}`; }
 
-function publicUrl(req, jobId, filename) {
-  return `${req.protocol}://${req.get("host")}/files/${jobId}/${filename}`;
-}
-
-async function downloadToFile(url, destPath) {
+async function downloadToFile(url, dest) {
   const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to download ${url} (status ${res.status})`);
-  }
-  const fileStream = createWriteStream(destPath);
-  await finished(Readable.fromWeb(res.body).pipe(fileStream));
+  if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
+  await finished(Readable.fromWeb(res.body).pipe(createWriteStream(dest)));
 }
 
+// ── health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// ── Bluesky ───────────────────────────────────────────────────────────────────
 const BLUESKY_IDENTIFIER = process.env.BLUESKY_IDENTIFIER || "earthinsider.bsky.social";
 const BLUESKY_PASSWORD   = process.env.BLUESKY_PASSWORD;
 
-/**
- * POST /bluesky-post
- * Body: { video_url, text, facets?, published_url?, card_title?, card_description? }
- *
- * Handles the full Bluesky video post flow on this server so n8n never has
- * to hold large binary video data in memory:
- *   1. Create session
- *   2. Download video from render's own /files/ URL (local-ish fetch)
- *   3. Upload blob to Bluesky
- *   4. Create post record (app.bsky.embed.video)
- */
 app.post("/bluesky-post", async (req, res) => {
-  const { video_url, text, facets, published_url, card_title, card_description } = req.body || {};
-
-  if (!video_url || !text) {
-    return res.status(400).json({ error: "video_url and text are required" });
-  }
-  if (!BLUESKY_PASSWORD) {
-    return res.status(500).json({ error: "BLUESKY_PASSWORD env var not set" });
-  }
-
+  const { video_url, text, facets } = req.body || {};
+  if (!video_url || !text) return res.status(400).json({ error: "video_url and text required" });
+  if (!BLUESKY_PASSWORD)  return res.status(500).json({ error: "BLUESKY_PASSWORD not set" });
   try {
-    // 1. Auth
-    const sessionRes = await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const sess = await (await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ identifier: BLUESKY_IDENTIFIER, password: BLUESKY_PASSWORD }),
-    });
-    const session = await sessionRes.json();
-    if (!session.accessJwt) {
-      throw new Error("Bluesky auth failed: " + JSON.stringify(session).slice(0, 200));
-    }
+    })).json();
+    if (!sess.accessJwt) throw new Error("Bluesky auth failed: " + JSON.stringify(sess).slice(0, 200));
 
-    // 2. Download video (fetching from our own /files/ URL — lightweight)
-    const vidRes = await fetch(video_url);
-    if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
-    const vidBuf = Buffer.from(await vidRes.arrayBuffer());
-
-    // 3. Upload blob
-    const blobRes = await fetch("https://bsky.social/xrpc/com.atproto.repo.uploadBlob", {
+    const vidBuf = Buffer.from(await (await fetch(video_url)).arrayBuffer());
+    const blobData = await (await fetch("https://bsky.social/xrpc/com.atproto.repo.uploadBlob", {
       method: "POST",
-      headers: { Authorization: `Bearer ${session.accessJwt}`, "Content-Type": "video/mp4" },
+      headers: { Authorization: `Bearer ${sess.accessJwt}`, "Content-Type": "video/mp4" },
       body: vidBuf,
-    });
-    const blobData = await blobRes.json();
-    if (!blobData.blob) {
-      throw new Error("Blob upload failed: " + JSON.stringify(blobData).slice(0, 200));
-    }
+    })).json();
+    if (!blobData.blob) throw new Error("Blob upload failed: " + JSON.stringify(blobData).slice(0, 200));
 
-    // 4. Create post record
-    const record = {
-      "$type": "app.bsky.feed.post",
-      text,
-      facets: facets || [],
-      createdAt: new Date().toISOString(),
-      embed: {
-        "$type": "app.bsky.embed.video",
-        video: blobData.blob,
-        aspectRatio: { width: 9, height: 16 },
-      },
-    };
-    const postRes = await fetch("https://bsky.social/xrpc/com.atproto.repo.createRecord", {
+    const postData = await (await fetch("https://bsky.social/xrpc/com.atproto.repo.createRecord", {
       method: "POST",
-      headers: { Authorization: `Bearer ${session.accessJwt}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ repo: session.did, collection: "app.bsky.feed.post", record }),
-    });
-    const postData = await postRes.json();
+      headers: { Authorization: `Bearer ${sess.accessJwt}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: sess.did, collection: "app.bsky.feed.post", record: {
+        "$type": "app.bsky.feed.post", text, facets: facets || [],
+        createdAt: new Date().toISOString(),
+        embed: { "$type": "app.bsky.embed.video", video: blobData.blob, aspectRatio: { width: 9, height: 16 } },
+      }}),
+    })).json();
 
-    res.json({ success: true, uri: postData.uri, cid: postData.cid });
+    res.json({ success: true, uri: postData.uri });
   } catch (err) {
     console.error("[bluesky-post]", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /render
- * Body: { text: string, image_url: string, speed?: number, voice?: string }
- * Response: { job_id, duration_seconds, reel_url, wide_url }
- *
- * n8n should fetch reel_url / wide_url (HTTP Request node, response format
- * "file"), upload each to Cloudinary as usual, then call
- * DELETE /files/:job_id once both uploads are confirmed.
- */
-app.post("/render", async (req, res) => {
-  const { text, image_url, speed, voice } = req.body || {};
+// ── Tumblr ────────────────────────────────────────────────────────────────────
+const TBL_CK  = process.env.TUMBLR_CONSUMER_KEY;
+const TBL_CS  = process.env.TUMBLR_CONSUMER_SECRET;
+const TBL_AT  = process.env.TUMBLR_ACCESS_TOKEN;
+const TBL_AS  = process.env.TUMBLR_ACCESS_SECRET;
+const TBL_BLG = process.env.TUMBLR_BLOG || "earthinsider.tumblr.com";
 
-  if (!text || !image_url) {
-    return res.status(400).json({ error: "text and image_url are required" });
+function tumblrOAuth(method, url) {
+  const nonce = randomUUID().replace(/-/g, "");
+  const ts    = Math.floor(Date.now() / 1000).toString();
+  const p     = { oauth_consumer_key: TBL_CK, oauth_nonce: nonce,
+                  oauth_signature_method: "HMAC-SHA1", oauth_timestamp: ts,
+                  oauth_token: TBL_AT, oauth_version: "1.0" };
+  const base  = [method.toUpperCase(), encodeURIComponent(url),
+    encodeURIComponent(Object.keys(p).sort().map(k => `${encodeURIComponent(k)}=${encodeURIComponent(p[k])}`).join("&"))
+  ].join("&");
+  p.oauth_signature = createHmac("sha1", `${encodeURIComponent(TBL_CS)}&${encodeURIComponent(TBL_AS)}`).update(base).digest("base64");
+  return "OAuth " + Object.entries(p).map(([k, v]) => `${k}="${encodeURIComponent(v)}"`).join(", ");
+}
+
+app.post("/tumblr-video", async (req, res) => {
+  const { video_url, caption, tags } = req.body || {};
+  if (!video_url) return res.status(400).json({ error: "video_url required" });
+  if (!TBL_CK || !TBL_CS || !TBL_AT || !TBL_AS) return res.status(500).json({ error: "Tumblr creds not set" });
+  try {
+    const vidBuf = Buffer.from(await (await fetch(video_url)).arrayBuffer());
+    const form   = new FormData();
+    form.append("type",    "video");
+    form.append("caption", caption || "");
+    form.append("tags",    tags    || "");
+    form.append("data",    new Blob([vidBuf], { type: "video/mp4" }), "video.mp4");
+    const url = `https://api.tumblr.com/v2/blog/${TBL_BLG}/post`;
+    const r   = await fetch(url, { method: "POST", headers: { Authorization: tumblrOAuth("POST", url) }, body: form });
+    const d   = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`Tumblr failed (${r.status}): ${JSON.stringify(d).slice(0, 300)}`);
+    res.json({ success: true, tumblr_id: d.response?.id });
+  } catch (err) {
+    console.error("[tumblr-video]", err);
+    res.status(500).json({ error: err.message });
   }
+});
+
+// ── /render ───────────────────────────────────────────────────────────────────
+app.post("/render", async (req, res) => {
+  const { text, image_url, speed, voice, hook_text } = req.body || {};
+  if (!text || !image_url) return res.status(400).json({ error: "text and image_url required" });
 
   const jobId = randomUUID();
-  const dir = jobDir(jobId);
-  const t0 = Date.now();
-  const lap = (label, from) => {
-    const ms = Date.now() - from;
-    console.log(`[render:${jobId}] ${label}: ${(ms / 1000).toFixed(1)}s`);
-    return Date.now();
-  };
+  const dir   = jobDir(jobId);
+  const t0    = Date.now();
+  const lap   = (label, from) => { console.log(`[render:${jobId}] ${label}: ${((Date.now()-from)/1000).toFixed(1)}s`); return Date.now(); };
 
   try {
     await mkdir(dir, { recursive: true });
 
-    // 1. Source image
     let t = Date.now();
+
+    // 1. Image
     const imagePath = path.join(dir, "source.jpg");
     await downloadToFile(image_url, imagePath);
     t = lap("download image", t);
 
-    // 2. Text -> speech
+    // 2. TTS + subtitles
     const rawAudioPath = path.join(dir, "voice_raw.mp3");
-    await generateSpeech(text, rawAudioPath, { voice });
-    t = lap("cloudflare tts", t);
+    const vttPath      = path.join(dir, "captions.vtt");
+    await generateSpeech(text, rawAudioPath, vttPath, { voice });
+    t = lap("edge-tts", t);
 
-    // 3. Speed up (pitch preserved)
-    const finalAudioPath = path.join(dir, "voice.wav");
-    await speedUpAudio(rawAudioPath, finalAudioPath, speed || DEFAULT_SPEED);
+    // 3. Speed up + prepend hook silence
+    const finalAudioPath = path.join(dir, "voice.mp3");
+    await speedUpAudio(rawAudioPath, finalAudioPath, speed || DEFAULT_SPEED, HOOK_DURATION_SECS);
     t = lap("speed up audio", t);
 
-    // 4. Duration drives both videos' length
+    // 4. Duration (includes hook silence)
     const durationSeconds = await getAudioDuration(finalAudioPath);
     t = lap("probe duration", t);
 
-    // 5. Render both formats
+    // 5. Generate ASS subtitle files (one per aspect ratio)
+    let assReel = null, assWide = null;
+    try {
+      const vttContent = await readFile(vttPath, "utf8");
+      const words = parseVTT(vttContent);
+      if (words.length > 0) {
+        const hookStr = (hook_text || "").trim();
+        const reelASS = buildASS(words, hookStr, 1080, 1920);
+        const wideASS = buildASS(words, hookStr, 1920, 1080);
+        assReel = path.join(dir, "captions_reel.ass");
+        assWide = path.join(dir, "captions_wide.ass");
+        await writeFile(assReel, reelASS, "utf8");
+        await writeFile(assWide, wideASS, "utf8");
+      }
+    } catch (e) {
+      console.warn(`[render:${jobId}] Subtitle generation skipped:`, e.message);
+    }
+    t = lap("build ASS subtitles", t);
+
+    // 6. Render videos
     const reelPath = path.join(dir, "reel.mp4");
     const widePath = path.join(dir, "wide.mp4");
-    await buildReel(imagePath, finalAudioPath, durationSeconds, reelPath);
+    await buildReel(imagePath, finalAudioPath, durationSeconds, reelPath, assReel);
     t = lap("build reel", t);
-    await buildWide(imagePath, finalAudioPath, durationSeconds, widePath);
+    await buildWide(imagePath, finalAudioPath, durationSeconds, widePath, assWide);
     t = lap("build wide", t);
 
     lap("TOTAL", t0);
 
-    // 6. Schedule the safety-net cleanup
-    setTimeout(() => {
-      rm(dir, { recursive: true, force: true }).catch(() => {});
-    }, AUTO_CLEANUP_MS);
+    setTimeout(() => rm(dir, { recursive: true, force: true }).catch(() => {}), AUTO_CLEANUP_MS);
 
     res.json({
       job_id: jobId,
@@ -192,121 +190,20 @@ app.post("/render", async (req, res) => {
   } catch (err) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     console.error(`[render:${jobId}]`, err);
-    res.status(500).json({ error: err.message || "render failed" });
-  }
-});
-
-// ── Tumblr ────────────────────────────────────────────────────────────────────
-const TUMBLR_CONSUMER_KEY    = process.env.TUMBLR_CONSUMER_KEY;
-const TUMBLR_CONSUMER_SECRET = process.env.TUMBLR_CONSUMER_SECRET;
-const TUMBLR_ACCESS_TOKEN    = process.env.TUMBLR_ACCESS_TOKEN;
-const TUMBLR_ACCESS_SECRET   = process.env.TUMBLR_ACCESS_SECRET;
-const TUMBLR_BLOG            = process.env.TUMBLR_BLOG || "earthinsider.tumblr.com";
-
-// OAuth1 header for multipart/form-data requests.
-// Per OAuth1 spec: body params are NOT included in the signature base string
-// for multipart uploads — only the OAuth header params go in.
-function buildTumblrOAuthHeader(method, url) {
-  const nonce     = randomUUID().replace(/-/g, "");
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-
-  const oauthParams = {
-    oauth_consumer_key:     TUMBLR_CONSUMER_KEY,
-    oauth_nonce:            nonce,
-    oauth_signature_method: "HMAC-SHA1",
-    oauth_timestamp:        timestamp,
-    oauth_token:            TUMBLR_ACCESS_TOKEN,
-    oauth_version:          "1.0",
-  };
-
-  const paramStr = Object.keys(oauthParams)
-    .sort()
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
-    .join("&");
-
-  const baseString = [
-    method.toUpperCase(),
-    encodeURIComponent(url),
-    encodeURIComponent(paramStr),
-  ].join("&");
-
-  const signingKey = `${encodeURIComponent(TUMBLR_CONSUMER_SECRET)}&${encodeURIComponent(TUMBLR_ACCESS_SECRET)}`;
-  oauthParams.oauth_signature = createHmac("sha1", signingKey).update(baseString).digest("base64");
-
-  return "OAuth " + Object.entries(oauthParams)
-    .map(([k, v]) => `${k}="${encodeURIComponent(v)}"`)
-    .join(", ");
-}
-
-/**
- * POST /tumblr-video
- * Body: { video_url, caption, tags }
- * Downloads the video from our own /files/ URL, signs the request with
- * OAuth1, and posts to Tumblr's legacy video endpoint — so n8n never
- * needs to touch the binary file.
- */
-app.post("/tumblr-video", async (req, res) => {
-  const { video_url, caption, tags } = req.body || {};
-
-  if (!video_url) return res.status(400).json({ error: "video_url is required" });
-  if (!TUMBLR_CONSUMER_KEY || !TUMBLR_CONSUMER_SECRET || !TUMBLR_ACCESS_TOKEN || !TUMBLR_ACCESS_SECRET) {
-    return res.status(500).json({ error: "Tumblr credential env vars not set" });
-  }
-
-  try {
-    // 1. Download video
-    const vidRes = await fetch(video_url);
-    if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
-    const vidBuf = Buffer.from(await vidRes.arrayBuffer());
-
-    // 2. Build multipart form — Node 18+ built-in FormData + Blob
-    const form = new FormData();
-    form.append("type",    "video");
-    form.append("caption", caption || "");
-    form.append("tags",    tags    || "");
-    form.append("data",    new Blob([vidBuf], { type: "video/mp4" }), "video.mp4");
-
-    // 3. OAuth1 sign + post
-    const tumblrUrl = `https://api.tumblr.com/v2/blog/${TUMBLR_BLOG}/post`;
-    const authHeader = buildTumblrOAuthHeader("POST", tumblrUrl);
-
-    const postRes = await fetch(tumblrUrl, {
-      method:  "POST",
-      headers: { Authorization: authHeader },
-      body:    form,
-    });
-
-    const data = await postRes.json().catch(() => ({}));
-    if (!postRes.ok) {
-      throw new Error(`Tumblr failed (${postRes.status}): ${JSON.stringify(data).slice(0, 300)}`);
-    }
-
-    res.json({ success: true, tumblr_id: data.response?.id });
-  } catch (err) {
-    console.error("[tumblr-video]", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Static file serving ───────────────────────────────────────────────────────
-// Serves the two rendered files for a job so n8n can fetch them.
+// ── static files ──────────────────────────────────────────────────────────────
 app.get("/files/:jobId/:filename", (req, res) => {
   const { jobId, filename } = req.params;
-  if (!["reel.mp4", "wide.mp4"].includes(filename)) {
-    return res.status(404).end();
-  }
-  res.sendFile(path.join(jobDir(jobId), filename), (err) => {
-    if (err && !res.headersSent) res.status(404).end();
-  });
+  if (!["reel.mp4", "wide.mp4"].includes(filename)) return res.status(404).end();
+  res.sendFile(path.join(jobDir(jobId), filename), err => { if (err && !res.headersSent) res.status(404).end(); });
 });
 
-// n8n calls this once both videos are uploaded to Cloudinary.
 app.delete("/files/:jobId", async (req, res) => {
-  const { jobId } = req.params;
-  await rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {});
+  await rm(jobDir(req.params.jobId), { recursive: true, force: true }).catch(() => {});
   res.json({ deleted: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`earthinsider-media-renderer listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`earthinsider-media-renderer listening on :${PORT}`));
