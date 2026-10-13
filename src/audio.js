@@ -4,21 +4,36 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 /**
- * Speed up audio (pitch preserved) and prepend silence for the hook text.
- * silenceBefore: seconds of silence added at the start so the hook text
- * shows before the voiceover begins.
+ * Builds the final voice track:
+ *   [hook] + short pause + [script]  ->  speed change (pitch preserved)  ->  small tail of silence
+ * The hook is optional. Returns nothing; use getAudioDuration() afterwards.
  */
-export async function speedUpAudio(inputPath, outputPath, speed = 1.0, silenceBefore = 2.0) {
-  const delayMs  = Math.round(silenceBefore * 1000);
-  const filterStr = `adelay=${delayMs}|${delayMs},atempo=${speed}`;
+export async function buildFinalAudio({ hookPath, scriptPath, outputPath, speed = 1.0, pause = 0.35, tail = 0.4 }) {
+  const tempo = Math.min(2, Math.max(0.5, Number(speed) || 1));
+  let inputs, filter;
+
+  if (hookPath) {
+    inputs = ["-i", hookPath, "-i", scriptPath];
+    filter =
+      `[0:a]apad=pad_dur=${pause}[h];` +
+      `[h][1:a]concat=n=2:v=0:a=1[c];` +
+      `[c]atempo=${tempo},apad=pad_dur=${tail}[out]`;
+  } else {
+    inputs = ["-i", scriptPath];
+    filter = `[0:a]atempo=${tempo},apad=pad_dur=${tail}[out]`;
+  }
 
   await run("ffmpeg", [
     "-y",
-    "-i", inputPath,
-    "-filter:a", filterStr,
-    "-vn",
+    ...inputs,
+    "-filter_complex", filter,
+    "-map", "[out]",
+    "-c:a", "libmp3lame",
+    "-b:a", "192k",
     outputPath,
   ]);
+
+  return tempo;
 }
 
 export async function getAudioDuration(filePath) {
