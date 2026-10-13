@@ -9,10 +9,7 @@ async function buildVideo(imagePath, audioPath, durationSec, outPath, W, H, extr
     `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,` +
     `setsar=1`;
 
-  if (assPath) {
-    // Burn ASS subtitles (hook text + word-by-word captions)
-    vf += `,ass=${assPath}`;
-  }
+  if (assPath) vf += `,ass=${assPath}`; // burn in the captions
 
   await run("ffmpeg", [
     "-y",
@@ -35,13 +32,12 @@ async function buildVideo(imagePath, audioPath, durationSec, outPath, W, H, extr
   ]);
 }
 
-// 9:16 reel — 1080x1920, black letterbox
-// -aspect 9:16 flags portrait so Buffer/YouTube detect it correctly
+// 9:16 reel — 1080x1920, black bars. -aspect 9:16 flags it as portrait for YouTube Shorts.
 export async function buildReel(imagePath, audioPath, durationSec, outPath, assPath = null) {
   return buildVideo(imagePath, audioPath, durationSec, outPath, 1080, 1920, ["-aspect", "9:16"], assPath);
 }
 
-// 16:9 wide — 1920x1080, black pillarbox
+// 16:9 wide — 1920x1080, black sides.
 export async function buildWide(imagePath, audioPath, durationSec, outPath, assPath = null) {
   return buildVideo(imagePath, audioPath, durationSec, outPath, 1920, 1080, [], assPath);
 }
