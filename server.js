@@ -9,7 +9,7 @@ import { finished } from "node:stream/promises";
 import { generateSpeech } from "./src/tts.js";
 import { buildFinalAudio, getAudioDuration } from "./src/audio.js";
 import { buildReel, buildWide } from "./src/video.js";
-import { buildASS } from "./src/subtitles.js";
+import { buildASS, measureWords } from "./src/subtitles.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -203,10 +203,11 @@ app.post("/render", async (req, res) => {
       // atempo changes playback speed, so word times shrink by the same factor
       const all = [...words, ...scriptWords].map((w) => ({ ...w, start: w.start / tempo, end: w.end / tempo }));
       if (all.length) {
+        const metrics = await measureWords(all); // exact word widths for the rounded highlight box
         assReel = path.join(dir, "captions_reel.ass");
         assWide = path.join(dir, "captions_wide.ass");
-        await writeFile(assReel, buildASS(all, 1080, 1920), "utf8");
-        await writeFile(assWide, buildASS(all, 1920, 1080), "utf8");
+        await writeFile(assReel, buildASS(all, 1080, 1920, metrics), "utf8");
+        await writeFile(assWide, buildASS(all, 1920, 1080, metrics), "utf8");
       }
     } catch (e) {
       console.warn(`[render:${jobId}] captions skipped:`, e.message);
