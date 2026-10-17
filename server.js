@@ -7,7 +7,8 @@ import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 
 import { generateSpeech } from "./src/tts.js";
-import { buildFinalAudio, getAudioDuration } from "./src/audio.js";
+import { joinVoice, cleanVoice, mixFinal, getAudioDuration } from "./src/audio.js";
+import { ensureAssets, pickMusic } from "./src/sfx.js";
 import { buildReel, buildWide } from "./src/video.js";
 import { buildASS, measureWords } from "./src/subtitles.js";
 
@@ -15,7 +16,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
-const DEFAULT_SPEED = Number(process.env.DEFAULT_SPEED || 1.0);
+const DEFAULT_SPEED = Number(process.env.DEFAULT_SPEED || 1.15);
 const AUTO_CLEANUP_MS = Number(process.env.AUTO_CLEANUP_MINUTES || 30) * 60 * 1000;
 const HOOK_PAUSE = 0.35; // seconds of silence between the spoken hook and the script
 const JOBS_DIR = path.join(process.cwd(), "jobs");
@@ -138,10 +139,10 @@ app.post("/tumblr-video", async (req, res) => {
 });
 
 // ── /render ───────────────────────────────────────────────────────────────────
-// Body: { text, hook_text?, image_url, speed?, voice? }
+// Body: { text, hook_text?, image_url, speed?, voice?, music? }  (music:false turns off the music + whoosh)
 //   hook_text = spoken first (same line that's printed on the image), then `text`.
 app.post("/render", async (req, res) => {
-  const { text, hook_text, image_url, speed, voice } = req.body || {};
+  const { text, hook_text, image_url, speed, voice, music } = req.body || {};
   if (!text || !image_url) return res.status(400).json({ error: "text and image_url required" });
 
   const jobId = randomUUID();
@@ -152,6 +153,7 @@ app.post("/render", async (req, res) => {
     return Date.now();
   };
   const readWords = async (p) => JSON.parse(await readFile(p, "utf8"));
+  const firstLine = (e) => String(e?.message || e).trim().split("\n")[0];
 
   try {
     await mkdir(dir, { recursive: true });
@@ -173,17 +175,50 @@ app.post("/render", async (req, res) => {
     await generateSpeech(text, scriptAudio, scriptWordsPath, { voice });
     t = lap("edge-tts", t);
 
-    // 3. Join hook + pause + script, apply speed
-    const finalAudio = path.join(dir, "voice.mp3");
-    const tempo = await buildFinalAudio({
+    // 3. Join hook + pause + script, speed up
+    const hookDur = hook ? await getAudioDuration(hookAudio) : 0;
+    const joined = path.join(dir, "voice_joined.wav");
+    const tempo = await joinVoice({
       hookPath: hook ? hookAudio : null,
       scriptPath: scriptAudio,
-      outputPath: finalAudio,
+      outputPath: joined,
       speed: speed || DEFAULT_SPEED,
       pause: HOOK_PAUSE,
     });
+    t = lap("join voice", t);
+
+    // 3b. Clean the voice and set loudness (-14 LUFS). Never fatal.
+    let finalAudio = joined;
+    try {
+      const cleaned = path.join(dir, "voice_clean.wav");
+      await cleanVoice(joined, cleaned);
+      finalAudio = cleaned;
+    } catch (e) {
+      console.warn(`[render:${jobId}] voice clean-up skipped:`, firstLine(e));
+    }
+    t = lap("clean voice", t);
+
+    // 3c. Background music (ducked under the voice) + whoosh. Never fatal.
+    if (music !== false && process.env.MUSIC_ENABLED !== "0") {
+      try {
+        const assets = await ensureAssets(JOBS_DIR);
+        const mixed = path.join(dir, "voice_final.wav");
+        const sfx = [{ t: 0, vol: 0.5 }];
+        if (hook) sfx.push({ t: Math.max(0, (hookDur + HOOK_PAUSE) / tempo - 0.45), vol: 0.8 });
+        await mixFinal({
+          voicePath: finalAudio,
+          outputPath: mixed,
+          musicPath: await pickMusic(jobId, assets.bed),
+          whooshPath: assets.whoosh,
+          sfx,
+        });
+        finalAudio = mixed;
+      } catch (e) {
+        console.warn(`[render:${jobId}] music/whoosh skipped:`, firstLine(e));
+      }
+    }
     const durationSeconds = await getAudioDuration(finalAudio);
-    t = lap("build audio", t);
+    t = lap("mix audio", t);
 
     // 4. Captions (never fatal — video still renders without them)
     let assReel = null;
@@ -193,7 +228,7 @@ app.post("/render", async (req, res) => {
       let offset = 0;
       if (hook) {
         words = await readWords(hookWordsPath);
-        offset = (await getAudioDuration(hookAudio)) + HOOK_PAUSE;
+        offset = hookDur + HOOK_PAUSE;
       }
       const scriptWords = (await readWords(scriptWordsPath)).map((w) => ({
         ...w,
@@ -253,4 +288,8 @@ app.delete("/files/:jobId", async (req, res) => {
   res.json({ deleted: true });
 });
 
-app.listen(PORT, () => console.log(`earthinsider-media-renderer listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`earthinsider-media-renderer listening on :${PORT}`);
+  // build the whoosh + music bed once in the background so the first render isn't slower
+  ensureAssets(JOBS_DIR).catch((e) => console.warn("[assets] warm-up failed:", String(e.message).split("\n")[0]));
+});
